@@ -1,0 +1,197 @@
+name: Озвучка книг
+
+# Озвучивает книги, отмеченные в читалке astrolog-lev.ru/chitalka/ («Вид» → «Озвучить эту книгу»), голосом Vosk «male_1».
+# Здесь — только этот сценарий: программа озвучки и тексты книг лежат в закрытом репозитории AstroLearning
+# (tools/audio_book.py, README «Озвучка»), сценарий берёт их оттуда по пропуску ASTROLEARNING_TOKEN.
+# Репозиторий открытый ради минут GitHub без ограничений: журналы видны всем, поэтому в них нет текста книг,
+# а части озвучки между машинами передаются зашифрованными (ключ — из секрета BOOKS_SSH_KEY).
+# Книга делится на части по ~150 тысяч знаков, части читают разные машины одновременно, потом склейка и отправка
+# на сервер (тем же ключом books-deploy, что у AstroLearning). За запуск — одна книга; запуск — вручную (Run workflow).
+on:
+  # Расписание включается, когда владелец одобрит качество (20 октября 2026: сначала проба). Включить — вернуть:
+  #   schedule:
+  #     - cron: "17 * * * *"
+  workflow_dispatch:
+
+concurrency: voice
+
+permissions:
+  contents: read
+
+env:
+  DEPLOY_HOST: astrolog-lev.ru
+
+jobs:
+  plan:
+    name: Что озвучить
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      html: ${{ steps.queue.outputs.html }}
+      source: ${{ steps.queue.outputs.source }}
+      parts: ${{ steps.queue.outputs.parts }}
+      count: ${{ steps.queue.outputs.count }}
+    steps:
+      - name: Секреты на месте
+        env:
+          T: ${{ secrets.ASTROLEARNING_TOKEN }}
+          K: ${{ secrets.BOOKS_SSH_KEY }}
+        run: |
+          [ -n "$T" ] || { echo "::error::Нет секрета ASTROLEARNING_TOKEN (Settings → Secrets and variables → Actions)"; exit 1; }
+          [ -n "$K" ] || { echo "::error::Нет секрета BOOKS_SSH_KEY (Settings → Secrets and variables → Actions)"; exit 1; }
+      - name: Ключ к серверу
+        env:
+          BOOKS_SSH_KEY: ${{ secrets.BOOKS_SSH_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          python3 - <<'PY'
+          import os, re
+          key = os.environ["BOOKS_SSH_KEY"].replace("\r", "")
+          m = re.search(r"-----\s*BEGIN ([A-Z ]+?)\s*-----(.*?)-----\s*END", key, re.S)
+          if not m:
+              raise SystemExit("::error::В секрете BOOKS_SSH_KEY нет строк BEGIN и END: скопируйте ключ целиком")
+          kind, body = m.group(1).strip(), re.sub(r"\s", "", m.group(2))
+          lines = [body[i:i + 70] for i in range(0, len(body), 70)]
+          with open(os.path.expanduser("~/.ssh/books"), "w") as fh:
+              fh.write(f"-----BEGIN {kind}-----\n" + "\n".join(lines) + f"\n-----END {kind}-----\n")
+          PY
+          chmod 600 ~/.ssh/books
+          ssh-keyscan -H "$DEPLOY_HOST" > ~/.ssh/known_hosts 2> /dev/null
+          echo "ssh -T -i $HOME/.ssh/books -o IdentitiesOnly=yes -o ServerAliveInterval=30 root@$DEPLOY_HOST" > ~/server
+      - name: Что отмечено в читалке
+        run: $(cat ~/server) audio-list > ~/state.json
+      - uses: actions/checkout@v5
+        with:
+          repository: baturinleva72-lab/AstroLearning
+          token: ${{ secrets.ASTROLEARNING_TOKEN }}
+          path: al
+          sparse-checkout: |
+            /tools/
+            /книги/**/*.html
+          sparse-checkout-cone-mode: false
+      - name: Очередь
+        id: queue
+        run: |
+          pip install -q num2words beautifulsoup4 html5lib
+          python al/tools/audio_queue.py --all < ~/state.json > ~/queue.txt
+          if ! grep -q . ~/queue.txt; then echo "count=0" >> "$GITHUB_OUTPUT"; echo "Озвучивать нечего"; exit 0; fi
+          IFS="$(printf '\t')" read -r html source < ~/queue.txt
+          python3 - "$html" "$source" <<'PY' >> "$GITHUB_OUTPUT"
+          import json, math, os, re, sys
+          html, source = sys.argv[1], sys.argv[2]
+          chars = len(re.sub(r"<[^>]+>", "", open(html, encoding="utf-8").read()))
+          n = max(1, min(12, math.ceil(chars / 150_000)))
+          print(f"html={os.path.relpath(html, 'al')}")
+          print(f"source={source}")
+          print(f"parts={json.dumps(list(range(1, n + 1)))}")
+          print(f"count={n}")
+          print(f"{source}: {chars} знаков, {n} частей", file=sys.stderr)
+          PY
+
+  voice:
+    name: Часть ${{ matrix.part }}
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: true
+      matrix:
+        part: ${{ fromJSON(needs.plan.outputs.parts) }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: baturinleva72-lab/AstroLearning
+          token: ${{ secrets.ASTROLEARNING_TOKEN }}
+          path: al
+          sparse-checkout: |
+            /tools/
+            /книги/**/*.html
+          sparse-checkout-cone-mode: false
+      - name: Голос
+        run: |
+          pip install -q torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -q numpy vosk-tts onnxruntime silero-stress num2words beautifulsoup4 html5lib
+          command -v ffmpeg || { sudo apt-get update -q && sudo apt-get install -y -q ffmpeg; }
+          echo "Ядер: $(nproc), память: $(free -g | awk '/Mem/ {print $2}') ГБ"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/vosk
+          key: vosk-tts-ru-0.9-multi
+      - name: Озвучить часть
+        env:
+          AUDIO_PUBLIC_LOG: "1"
+          HTML: ${{ needs.plan.outputs.html }}
+          SOURCE: ${{ needs.plan.outputs.source }}
+          PART: ${{ matrix.part }}/${{ needs.plan.outputs.count }}
+          BOOKS_SSH_KEY: ${{ secrets.BOOKS_SSH_KEY }}
+        run: |
+          python al/tools/audio_book.py "al/$HTML" ~/out --source "$SOURCE" --part "$PART" --budget-minutes 320
+          KEY=$(printf '%s' "$BOOKS_SSH_KEY" | sha256sum | cut -d' ' -f1)
+          tar -C ~/out -c part.flac part.json | KEY="$KEY" openssl enc -aes-256-cbc -pbkdf2 -pass env:KEY -out ~/part.enc
+          rm -rf ~/out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: part-${{ matrix.part }}
+          path: ~/part.enc
+          retention-days: 1
+          compression-level: 0
+
+  join:
+    name: Склеить и отправить
+    needs: [plan, voice]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Ключ к серверу
+        env:
+          BOOKS_SSH_KEY: ${{ secrets.BOOKS_SSH_KEY }}
+        run: |
+          install -d -m 700 ~/.ssh
+          python3 - <<'PY'
+          import os, re
+          key = os.environ["BOOKS_SSH_KEY"].replace("\r", "")
+          m = re.search(r"-----\s*BEGIN ([A-Z ]+?)\s*-----(.*?)-----\s*END", key, re.S)
+          if not m:
+              raise SystemExit("::error::В секрете BOOKS_SSH_KEY нет строк BEGIN и END: скопируйте ключ целиком")
+          kind, body = m.group(1).strip(), re.sub(r"\s", "", m.group(2))
+          lines = [body[i:i + 70] for i in range(0, len(body), 70)]
+          with open(os.path.expanduser("~/.ssh/books"), "w") as fh:
+              fh.write(f"-----BEGIN {kind}-----\n" + "\n".join(lines) + f"\n-----END {kind}-----\n")
+          PY
+          chmod 600 ~/.ssh/books
+          ssh-keyscan -H "$DEPLOY_HOST" > ~/.ssh/known_hosts 2> /dev/null
+          echo "ssh -T -i $HOME/.ssh/books -o IdentitiesOnly=yes -o ServerAliveInterval=30 root@$DEPLOY_HOST" > ~/server
+      - uses: actions/checkout@v5
+        with:
+          repository: baturinleva72-lab/AstroLearning
+          token: ${{ secrets.ASTROLEARNING_TOKEN }}
+          path: al
+          sparse-checkout: |
+            /tools/
+            /книги/**/*.html
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: part-*
+          path: ~/parts
+      - name: Склеить
+        env:
+          HTML: ${{ needs.plan.outputs.html }}
+          SOURCE: ${{ needs.plan.outputs.source }}
+          BOOKS_SSH_KEY: ${{ secrets.BOOKS_SSH_KEY }}
+        run: |
+          pip install -q numpy num2words beautifulsoup4 html5lib
+          command -v ffmpeg || { sudo apt-get update -q && sudo apt-get install -y -q ffmpeg; }
+          KEY=$(printf '%s' "$BOOKS_SSH_KEY" | sha256sum | cut -d' ' -f1)
+          mkdir -p ~/join
+          for d in ~/parts/part-*; do
+            i=${d##*-}; mkdir -p ~/tmp$i
+            KEY="$KEY" openssl enc -d -aes-256-cbc -pbkdf2 -pass env:KEY -in "$d/part.enc" | tar -C ~/tmp$i -x
+            mv ~/tmp$i/part.flac ~/join/part$(printf '%02d' "$i").flac
+            mv ~/tmp$i/part.json ~/join/part$(printf '%02d' "$i").json
+          done
+          rm -rf ~/parts
+          python al/tools/audio_book.py "al/$HTML" ~/out --source "$SOURCE" --join ~/join
+      - name: Отправить в читалку
+        run: tar -C ~/out -c manifest.json sync.json audio.m4a | $(cat ~/server) audio-put
