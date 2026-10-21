@@ -9,10 +9,14 @@ name: Озвучка книг
 # разные машины, потом склейка и отправка на сервер (тем же ключом books-deploy, что у AstroLearning). За запуск —
 # одна книга. С 21 октября 2026 вся озвучка — здесь; в AstroLearning своей озвучки больше нет (там минуты платные).
 on:
-  # Расписание включается, когда владелец одобрит качество (20 октября 2026: сначала проба). Включить — вернуть:
-  #   schedule:
-  #     - cron: "17 * * * *"
+  schedule:                                  # раз в час (с 21 октября 2026, владелец одобрил качество по пробам)
+    - cron: "17 * * * *"
   workflow_dispatch:
+    inputs:
+      book:
+        description: "Какую книгу первой (часть названия, например «Полная астрология»); пусто — самую короткую из отмеченных"
+        required: false
+        default: ""
 
 concurrency: voice
 
@@ -72,9 +76,19 @@ jobs:
           sparse-checkout-cone-mode: false
       - name: Очередь
         id: queue
+        env:
+          BOOK: ${{ github.event.inputs.book }}
         run: |
           pip install -q num2words beautifulsoup4 html5lib
           python al/tools/audio_queue.py --all < ~/state.json > ~/queue.txt
+          if [ -n "$BOOK" ]; then
+            grep -F -- "$BOOK" ~/queue.txt > ~/chosen.txt || true
+            if ! grep -q . ~/chosen.txt; then
+              echo "::warning::«$BOOK» нет в очереди: книга не отмечена «Озвучить» или её запись уже свежая"
+              echo "count=0" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+            mv ~/chosen.txt ~/queue.txt
+          fi
           if ! grep -q . ~/queue.txt; then echo "count=0" >> "$GITHUB_OUTPUT"; echo "Озвучивать нечего"; exit 0; fi
           IFS="$(printf '\t')" read -r html source < ~/queue.txt
           python3 - "$html" "$source" <<'PY' >> "$GITHUB_OUTPUT"
